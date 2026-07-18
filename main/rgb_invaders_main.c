@@ -48,13 +48,10 @@ static rgb_color_t invader_color = COLOR_RED;
 volatile int score = 0;
 volatile bool game_over = false;
 int score_max = 0;
-
-
 #define I2C_MASTER_SDA_IO       8      
 #define I2C_MASTER_SCL_IO       9      
 #define I2C_MASTER_NUM          0      
-#define LCD_ADDR_27             0x27
-#define LCD_ADDR_3F             0x3F
+#define OLED_ADDR               0x3C
 
 // PCF8574 Pin Map
 #define PIN_RS                 (1 << 0)
@@ -63,119 +60,210 @@ int score_max = 0;
 #define BACKLIGHT              (1 << 3)
 
 static const char *TAG = "NVS";
-static const char *TAG2 = "LCD";
+static const char *TAG2 = "OLED";
 static const char *TAG3 = "GAME";
 static const char *TAG4 = "MAIN";
 static i2c_master_dev_handle_t dev_handle;
+static bool oled_ready = false;
+static uint8_t oled_buffer[1024];
+static uint8_t oled_cursor_x;
+static uint8_t oled_cursor_y;
+
+static void oled_send_cmd(uint8_t cmd);
+static void oled_refresh(void);
+static void oled_set_pixel(uint8_t x, uint8_t y, bool on);
+static void oled_draw_scaled_text(uint8_t x, uint8_t y, uint8_t scale, const char *str);
+static void oled_render_score(int value);
 
 // Task function prototype
 void nvs_storage_task(void *pvParameters);
-void lcd_task(void *pvParameters);
+void oled_task(void *pvParameters);
 void game_task(void *pvParameters);
 
-static esp_err_t i2c_write_raw(uint8_t data)
+static esp_err_t oled_write_cmd(uint8_t cmd)
 {
-    esp_err_t err =
-        i2c_master_transmit(
-            dev_handle,
-            &data,
-            1,
-            100);
-
+    uint8_t payload[2] = {0x00, cmd};
+    esp_err_t err = i2c_master_transmit(dev_handle, payload, sizeof(payload), 100);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG2,
-                 "Write 0x%02X failed: %s",
-                 data,
-                 esp_err_to_name(err));
+        ESP_LOGE(TAG2, "OLED cmd 0x%02X failed: %s", cmd, esp_err_to_name(err));
     }
-
     return err;
 }
 
-// Sends a single 4-bit nibble and executes a precise hardware clock pulse
-void lcd_send_nibble(uint8_t nibble, uint8_t mode) {
-    uint8_t data = ((nibble & 0x0F) << 4) | (mode & PIN_RS) | BACKLIGHT;
+static esp_err_t oled_write_data_bytes(const uint8_t *data, size_t len)
+{
+    uint8_t payload[129];
+    if (len > sizeof(payload) - 1) {
+        return ESP_ERR_INVALID_SIZE;
+    }
 
-    // Step 1: Set data pins and RS, keep Enable LOW
-    if (i2c_write_raw(data) != ESP_OK) {
-        ESP_LOGE(TAG2, "Failed to send nibble data");
+    payload[0] = 0x40;
+    memcpy(&payload[1], data, len);
+    esp_err_t err = i2c_master_transmit(dev_handle, payload, len + 1, 100);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG2, "OLED data write failed: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
+static void oled_refresh(void)
+{
+    for (uint8_t page = 0; page < 8; ++page) {
+        oled_send_cmd(0xB0 | page);
+        oled_send_cmd(0x00);
+        oled_send_cmd(0x10);
+        (void)oled_write_data_bytes(&oled_buffer[page * 128], 128);
+    }
+}
+
+static void oled_set_pixel(uint8_t x, uint8_t y, bool on)
+{
+    if (x >= 128 || y >= 64) {
         return;
     }
-    ets_delay_us(50);
 
-    // Step 2: Pull Enable HIGH to latch data setup
-    if (i2c_write_raw(data | PIN_EN) != ESP_OK) {
-        ESP_LOGE(TAG2, "Failed to send enable high");
+    size_t index = (size_t)x + ((size_t)y / 8U) * 128U;
+    uint8_t mask = (uint8_t)(1U << (y % 8U));
+    if (on) {
+        oled_buffer[index] |= mask;
+    } else {
+        oled_buffer[index] &= (uint8_t)~mask;
+    }
+}
+
+static void oled_draw_scaled_text(uint8_t x, uint8_t y, uint8_t scale, const char *str)
+{
+    (void)scale;
+
+    // Seven-segment masks for digits 0-9: bits are a,b,c,d,e,f,g.
+    static const uint8_t digit_masks[10] = {
+        0x3F, 0x06, 0x5B, 0x4F, 0x66,
+        0x6D, 0x7D, 0x07, 0x7F, 0x6F
+    };
+
+    size_t len = strlen(str);
+    if (len == 0) {
         return;
     }
-    ets_delay_us(50);
 
-    // Step 3: Pull Enable LOW to capture data edge
-    if (i2c_write_raw(data) != ESP_OK) {
-        ESP_LOGE(TAG2, "Failed to release enable");
-        return;
+    const int digit_w = 20;
+    const int digit_h = 44;
+    const int thickness = 4;
+    const int gap = 4;
+
+    for (size_t i = 0; i < len; ++i) {
+        char c = str[i];
+        if (c < '0' || c > '9') {
+            continue;
+        }
+
+        uint8_t mask = digit_masks[c - '0'];
+        int dx0 = (int)x + (int)i * (digit_w + gap);
+        int dy0 = (int)y;
+        int mid_y = digit_h / 2;
+
+        // Helper macro to fill a rectangle segment.
+#define DRAW_RECT(x0, y0, w, h)                                  \
+        do {                                                      \
+            for (int rx = 0; rx < (w); ++rx) {                   \
+                for (int ry = 0; ry < (h); ++ry) {               \
+                    oled_set_pixel((uint8_t)((x0) + rx),         \
+                                  (uint8_t)((y0) + ry), true);   \
+                }                                                 \
+            }                                                     \
+        } while (0)
+
+        // a
+        if (mask & 0x01) {
+            DRAW_RECT(dx0 + thickness, dy0, digit_w - 2 * thickness, thickness);
+        }
+        // b
+        if (mask & 0x02) {
+            DRAW_RECT(dx0 + digit_w - thickness, dy0, thickness, mid_y);
+        }
+        // c
+        if (mask & 0x04) {
+            DRAW_RECT(dx0 + digit_w - thickness, dy0 + mid_y, thickness, digit_h - mid_y);
+        }
+        // d
+        if (mask & 0x08) {
+            DRAW_RECT(dx0 + thickness, dy0 + digit_h - thickness, digit_w - 2 * thickness, thickness);
+        }
+        // e
+        if (mask & 0x10) {
+            DRAW_RECT(dx0, dy0 + mid_y, thickness, digit_h - mid_y);
+        }
+        // f
+        if (mask & 0x20) {
+            DRAW_RECT(dx0, dy0, thickness, mid_y);
+        }
+        // g
+        if (mask & 0x40) {
+            DRAW_RECT(dx0 + thickness,
+                      dy0 + mid_y - (thickness / 2),
+                      digit_w - 2 * thickness,
+                      thickness);
+        }
+
+#undef DRAW_RECT
     }
-    ets_delay_us(100);
 }
 
-// Split 8-bit instruction packet into two 4-bit transmissions
-void lcd_send_cmd(uint8_t cmd) {
-    lcd_send_nibble(cmd >> 4, 0);
-    lcd_send_nibble(cmd & 0x0F, 0);
-    vTaskDelay(pdMS_TO_TICKS(2));
+static void oled_render_score(int value)
+{
+    char score_text[16];
+    snprintf(score_text, sizeof(score_text), "%d", value);
+
+    memset(oled_buffer, 0, sizeof(oled_buffer));
+
+    const int digit_w = 20;
+    const int gap = 4;
+    const int digit_h = 44;
+    const int count = (int)strlen(score_text);
+    const int text_width = count * digit_w + (count > 0 ? (count - 1) * gap : 0);
+    const int start_x = (128 - text_width) / 2;
+    const int start_y = (64 - digit_h) / 2;
+
+    oled_draw_scaled_text((uint8_t)start_x, (uint8_t)start_y, 1, score_text);
+    oled_refresh();
 }
 
-// Split 8-bit character data packet into two 4-bit transmissions
-void lcd_send_data(uint8_t data) {
-    lcd_send_nibble(data >> 4, PIN_RS);
-    lcd_send_nibble(data & 0x0F, PIN_RS);
-    ets_delay_us(50);
+void oled_send_cmd(uint8_t cmd) {
+    (void)oled_write_cmd(cmd);
 }
 
-void lcd_clear(void) {
-    lcd_send_cmd(0x01); 
-    vTaskDelay(pdMS_TO_TICKS(5));
+void oled_clear(void) {
+    memset(oled_buffer, 0, sizeof(oled_buffer));
+    oled_cursor_x = 0;
+    oled_cursor_y = 0;
+    oled_refresh();
 }
 
-void lcd_set_cursor(uint8_t row, uint8_t col) {
-    uint8_t address = (row == 0) ? (0x00 + col) : (0x40 + col);
-    lcd_send_cmd(0x80 | address);
-}
-
-void lcd_send_string(const char *str) {
-    while (*str) {
-        lcd_send_data((uint8_t)(*str));
-        str++;
-    }
-}
-
-void lcd_init(void)
+void oled_init(void)
 {
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    lcd_send_nibble(0x03, 0);
-    vTaskDelay(pdMS_TO_TICKS(5));
+    oled_write_cmd(0xAE); // display off
+    oled_write_cmd(0xD5); oled_write_cmd(0x80); // clock divide
+    oled_write_cmd(0xA8); oled_write_cmd(0x3F); // multiplex 1/64
+    oled_write_cmd(0xD3); oled_write_cmd(0x00); // display offset
+    oled_write_cmd(0x40); // start line
+    oled_write_cmd(0x8D); oled_write_cmd(0x14); // charge pump on
+    oled_write_cmd(0x20); oled_write_cmd(0x02); // page addressing mode
+    oled_write_cmd(0xA1); // segment remap reverse
+    oled_write_cmd(0xC8); // com scan reverse
+    oled_write_cmd(0xDA); oled_write_cmd(0x12); // com pins
+    oled_write_cmd(0x81); oled_write_cmd(0xCF); // contrast
+    oled_write_cmd(0xD9); oled_write_cmd(0xF1); // pre-charge
+    oled_write_cmd(0xDB); oled_write_cmd(0x40); // vcom detect
+    oled_write_cmd(0xA4); // resume RAM
+    oled_write_cmd(0xA6); // normal display
+    oled_write_cmd(0xAF); // display on
 
-    lcd_send_nibble(0x03, 0);
-    vTaskDelay(pdMS_TO_TICKS(1));
-
-    lcd_send_nibble(0x03, 0);
-    vTaskDelay(pdMS_TO_TICKS(1));
-
-    lcd_send_nibble(0x02, 0);
-    vTaskDelay(pdMS_TO_TICKS(1));
-
-    lcd_send_cmd(0x28);
-    lcd_send_cmd(0x08);
-    lcd_send_cmd(0x01);
-    vTaskDelay(pdMS_TO_TICKS(2));
-    lcd_send_cmd(0x06);
-    lcd_send_cmd(0x0C);
-
-    vTaskDelay(pdMS_TO_TICKS(20));
+    oled_clear();
 }
 
-static bool lcd_attach_device(i2c_master_bus_handle_t bus_handle, uint8_t addr)
+static bool oled_attach_device(i2c_master_bus_handle_t bus_handle, uint8_t addr)
 {
     i2c_device_config_t dev_config = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
@@ -185,11 +273,11 @@ static bool lcd_attach_device(i2c_master_bus_handle_t bus_handle, uint8_t addr)
 
     esp_err_t err = i2c_master_bus_add_device(bus_handle, &dev_config, &dev_handle);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG2, "Failed to add LCD device at 0x%02X: %s", addr, esp_err_to_name(err));
+        ESP_LOGW(TAG2, "Failed to add OLED device at 0x%02X: %s", addr, esp_err_to_name(err));
         return false;
     }
 
-    ESP_LOGI(TAG2, "LCD device ready at 0x%02X", addr);
+    ESP_LOGI(TAG2, "OLED device ready at 0x%02X", addr);
     return true;
 }
 
@@ -230,10 +318,11 @@ static void init_led_strip(void) {
 
 static void spawn_new_invader(void) {
     invader_pos = NUM_LEDS - 1;
+    invader_tick_counter = 0;
     invader_color = (rgb_color_t)(esp_random() % COLOR_MAX);
     
     // Scale speed ticks dynamically based on current performance
-    invader_speed_ticks = 25 - (score * 2);
+    invader_speed_ticks = 60 - (score * 3);
     if (invader_speed_ticks < SPEED_LIMIT) invader_speed_ticks = SPEED_LIMIT; // Speed cap limit
 
     if (invader_color == COLOR_RED)   ESP_LOGI(TAG, "🔴 RED Invader approaching! Match with RED laser!");
@@ -251,10 +340,11 @@ static void trigger_flash(uint8_t r, uint8_t g, uint8_t b, int delay_ms) {
 
 
 void update_score_display(int score) {
-    char buffer[16];
-    snprintf(buffer, sizeof(buffer), "Score: %d", score);
-    lcd_set_cursor(1, 0);
-    lcd_send_string(buffer);
+    if (!oled_ready) {
+        return;
+    }
+
+    oled_render_score(score);
 }
 
 
@@ -291,30 +381,16 @@ void nvs_storage_task(void *pvParameters)
     }
 }
 
-void lcd_task(void *pvParameters)
+void oled_task(void *pvParameters)
 {
     int last_score = -1;
-    char buffer[16];
-
-    lcd_set_cursor(0,0);
-    lcd_send_string("RGB Invaders");
 
     while (1)
     {
         if (score != last_score)
         {
             last_score = score;
-
-            lcd_set_cursor(1,0);
-
-            snprintf(buffer,
-                     sizeof(buffer),
-                     "Score:%-5d",
-                     score);
-
-            lcd_send_string("                ");
-            lcd_set_cursor(1,0);
-            lcd_send_string(buffer);
+            update_score_display(score);
         }
 
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -334,6 +410,7 @@ void game_task(void *pvParameters)
             if (gpio_get_level(BUTTON_RED) == 0 || gpio_get_level(BUTTON_GREEN) == 0 || gpio_get_level(BUTTON_BLUE) == 0) {
                 laser_pos = -1;
                 score = 0;
+                update_score_display(score);
                 game_over = false;
                 spawn_new_invader();
                 vTaskDelay(pdMS_TO_TICKS(300));
@@ -384,6 +461,7 @@ void game_task(void *pvParameters)
             if (laser_color == invader_color) {
                 score++;
                 ESP_LOGI(TAG3, "DIRECT HIT! Score: %d", score);
+                update_score_display(score);
                 trigger_flash(255, 255, 255, 100);
                 laser_pos = -1;
                 spawn_new_invader();
@@ -435,41 +513,27 @@ void app_main(void)
     i2c_master_bus_handle_t bus_handle;
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_config, &bus_handle));
 
-    const uint8_t lcd_addresses[] = { LCD_ADDR_27, LCD_ADDR_3F };
-    bool lcd_ready = false;
     esp_err_t err = ESP_FAIL;
 
-    for (size_t i = 0; i < sizeof(lcd_addresses) / sizeof(lcd_addresses[0]); ++i) {
-        uint8_t addr = lcd_addresses[i];
-        err = i2c_master_probe(bus_handle, addr, pdMS_TO_TICKS(100));
-        if (err == ESP_OK) {
-            ESP_LOGI(TAG2, "Found LCD device at 0x%02X", addr);
-            if (lcd_attach_device(bus_handle, addr)) {
-                lcd_ready = true;
-                break;
-            }
+    err = i2c_master_probe(bus_handle, OLED_ADDR, pdMS_TO_TICKS(100));
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG2, "Found OLED device at 0x%02X", OLED_ADDR);
+        if (oled_attach_device(bus_handle, OLED_ADDR)) {
+            oled_ready = true;
         }
     }
 
-    if (!lcd_ready) {
-        ESP_LOGE(TAG2, "No LCD device found at 0x27 or 0x3F");
+    if (!oled_ready) {
+        ESP_LOGE(TAG2, "No OLED device found at 0x3C");
     } else {
         ESP_LOGI(TAG2, "Probe result: %s", esp_err_to_name(err));
 
         // Force hardware startup initialization
-        lcd_init();
+        oled_init();
 
-        lcd_clear();
+        oled_clear();
         vTaskDelay(pdMS_TO_TICKS(100));
-        i2c_write_raw(BACKLIGHT);
-        i2c_write_raw(0x00);
-        i2c_write_raw(BACKLIGHT);
-        i2c_write_raw(BACKLIGHT);
-        i2c_write_raw(0x00);
-        i2c_write_raw(BACKLIGHT);
 
-        lcd_set_cursor(0, 0);
-        lcd_send_string("Max Score: ");
         update_score_display(score);
     }
 
@@ -495,19 +559,19 @@ void app_main(void)
     
     ESP_LOGI(TAG, "nvs_storage_task task created successfully. app_main exiting loop control to RTOS scheduler.");
 
-    if (lcd_ready) {
+    if (oled_ready) {
         xTaskCreate(
-            lcd_task,             // Function that implements the task
-            "lcd_task",           // Text name for the task
+            oled_task,            // Function that implements the task
+            "oled_task",         // Text name for the task
             4096,                 // Stack depth in words
             NULL,                 // Parameter passed into the task
             tskIDLE_PRIORITY + 5,                    // Task priority
             NULL                  // Task handle (not needed here)
         );
 
-        ESP_LOGI(TAG2, "lcd_task task created successfully. app_main exiting loop control to RTOS scheduler.");
+        ESP_LOGI(TAG2, "oled_task task created successfully. app_main exiting loop control to RTOS scheduler.");
     } else {
-        ESP_LOGW(TAG2, "Skipping LCD task because no LCD was detected.");
+        ESP_LOGW(TAG2, "Skipping OLED task because no OLED was detected.");
     }
 
     xTaskCreate(
