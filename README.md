@@ -4,6 +4,8 @@
 
 This project is a small ESP-IDF arcade game built around a WS2812 LED strip, three color buttons, and a 128x64 SSD1306 OLED over I2C. A colored invader moves toward the base, and you fire a matching colored laser with the corresponding button. Score increases on a correct hit, and the current score is shown on the OLED.
 
+![Logo](images/be701dd2-cd60-41f6-a4c1-b57dc7a3cf85.jpeg)
+
 ## Hardware
 
 The current firmware uses these fixed pins and addresses:
